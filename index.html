@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live2D Cam ビューア（PC・OBS用）</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; font-family: system-ui, "Hiragino Sans", "Yu Gothic UI", sans-serif; }
+  body.bg-green { background: #00ff00; }
+  body.bg-blue { background: #0000ff; }
+  body.bg-dark { background: #1b1d24; }
+  #stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #panel { position: fixed; top: 12px; left: 12px; width: 310px; max-height: calc(100% - 24px); overflow: auto; box-sizing: border-box;
+    background: rgba(20, 22, 30, .92); color: #e9ecf3; border-radius: 12px; padding: 14px; font-size: 13px; line-height: 1.5; }
+  #panel h1 { font-size: 15px; margin: 0 0 8px; }
+  #panel h2 { font-size: 12px; margin: 14px 0 6px; color: #9fb4ff; font-weight: 600; }
+  #panel input[type=text] { width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px; border: 1px solid #444b5e; background: #11131a; color: #fff; font-size: 12px; }
+  #panel button { padding: 6px 10px; border-radius: 6px; border: 0; background: #4c6fff; color: #fff; font-size: 12px; cursor: pointer; margin: 4px 4px 0 0; }
+  #panel button.sub { background: #3a4052; }
+  #panel label { display: block; margin: 4px 0; }
+  #panel input[type=range] { width: 100%; }
+  #room { font-size: 22px; font-weight: 700; letter-spacing: 3px; }
+  #qr { background: #fff; padding: 8px; border-radius: 8px; display: inline-block; margin-top: 6px; }
+  #status { margin-top: 6px; padding: 6px 8px; border-radius: 6px; background: #2a2f3d; }
+  #status.ok { background: #1f5d3a; }
+  #status.ng { background: #6b2a2a; }
+  .hint { color: #9aa3b8; font-size: 11px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  body.obs #panel { display: none; }
+</style>
+</head>
+<body class="bg-dark">
+<canvas id="stage"></canvas>
+
+<div id="panel">
+  <h1>Live2D Cam ビューア</h1>
+  <div id="status">準備中…</div>
+
+  <h2>① iPhoneをつなぐ</h2>
+  <div>ルームコード: <span id="room"></span></div>
+  <div id="qr"></div>
+  <div class="hint">iPhoneのカメラでQRを読み、Safariで開いて「開始」を押してください。</div>
+
+  <h2>② モデルを読み込む</h2>
+  <input type="text" id="modelUrl" placeholder="model/xxxx.model3.json">
+  <button id="loadUrl">URLから読み込む</button>
+  <button id="pickBtn" class="sub">PCのフォルダから選ぶ</button>
+  <input type="file" id="pick" webkitdirectory multiple hidden>
+  <div class="hint">フォルダ選択はこのPC内だけで処理され、ネットには公開されません（OBSのブラウザソースでは使えません）。</div>
+
+  <h2>③ 調整</h2>
+  <div class="hint">ドラッグで移動・ホイールで拡大縮小</div>
+  <div class="row">
+    <label><input type="checkbox" id="mirror"> 鏡のように動かす</label>
+    <label><input type="checkbox" id="invX"> 左右を逆に</label>
+    <label><input type="checkbox" id="invY"> 上下を逆に</label>
+    <label><input type="checkbox" id="invZ"> 傾きを逆に</label>
+  </div>
+  <label>動きの大きさ <input type="range" id="gain" min="0.5" max="2.5" step="0.1"></label>
+  <label>なめらかさ <input type="range" id="smooth" min="0" max="0.9" step="0.05"></label>
+  <label>背景
+    <select id="bg">
+      <option value="dark">暗い（確認用）</option>
+      <option value="none">透明（OBSブラウザソース）</option>
+      <option value="green">グリーン（クロマキー）</option>
+      <option value="blue">ブルー（クロマキー）</option>
+    </select>
+  </label>
+  <button id="resetPos" class="sub">位置をリセット</button>
+
+  <h2>④ OBSに入れる</h2>
+  <button id="copyObs">OBS用URLをコピー</button>
+  <div class="hint">OBSの「ブラウザ」ソースに貼り付けます（URLからモデルを読み込んだ場合のみ）。貼ったらこのタブは閉じてください。Hキーでこのパネルを隠せます。</div>
+  <input type="text" id="obsUrl" readonly>
+</div>
+
+<script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var q = new URLSearchParams(location.search);
+  var KEY = 'live2dcam-settings';
+
+  // ---------- 設定 ----------
+  var S = { room: '', model: '', mirror: true, invX: false, invY: false, invZ: false, gain: 1.2, smooth: 0.5, bg: 'dark', z: 1, x: 0, y: 0 };
+  try { Object.assign(S, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch (e) {}
+  // URLパラメータが最優先（OBS用）
+  ['room', 'model', 'bg'].forEach(function (k) { if (q.has(k)) S[k] = q.get(k); });
+  ['gain', 'smooth', 'z', 'x', 'y'].forEach(function (k) { if (q.has(k)) S[k] = parseFloat(q.get(k)); });
+  ['mirror', 'invX', 'invY', 'invZ'].forEach(function (k) { if (q.has(k)) S[k] = q.get(k) === '1'; });
+  if (!S.room) {
+    var chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+    for (var i = 0; i < 6; i++) S.room += chars[Math.floor(Math.random() * chars.length)];
+  }
+  var OBS = q.get('obs') === '1';
+  if (OBS) { document.body.classList.add('obs'); if (!q.has('bg')) S.bg = 'none'; }
+
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
+    updateObsUrl();
+  }
+  function applyBg() { document.body.className = (OBS ? 'obs ' : '') + (S.bg === 'none' ? '' : 'bg-' + S.bg); }
+  function setStatus(text, cls) { var el = $('status'); el.textContent = text; el.className = cls || ''; }
+
+  function updateObsUrl() {
+    var u = new URL(location.href.split('?')[0].split('#')[0]);
+    var p = u.searchParams;
+    p.set('obs', '1'); p.set('room', S.room);
+    if (S.model) p.set('model', S.model);
+    p.set('mirror', S.mirror ? '1' : '0'); p.set('invX', S.invX ? '1' : '0'); p.set('invY', S.invY ? '1' : '0'); p.set('invZ', S.invZ ? '1' : '0');
+    p.set('gain', S.gain); p.set('smooth', S.smooth);
+    p.set('z', S.z.toFixed(3)); p.set('x', S.x.toFixed(3)); p.set('y', S.y.toFixed(3));
+    p.set('bg', 'none');
+    $('obsUrl').value = u.toString();
+  }
+
+  // ---------- 描画 ----------
+  var app = new PIXI.Application({
+    view: $('stage'), backgroundAlpha: 0, resizeTo: window, antialias: true,
+    autoDensity: true, resolution: Math.min(window.devicePixelRatio || 1, 2)
+  });
+  var model = null, baseW = 1, baseH = 1;
+
+  function layout() {
+    if (!model) return;
+    var w = app.screen.width, h = app.screen.height;
+    var base = Math.min(w / baseW, h / baseH);
+    model.scale.set(base * S.z);
+    model.x = w / 2 + S.x * w;
+    model.y = h / 2 + S.y * h;
+  }
+  window.addEventListener('resize', function () { setTimeout(layout, 0); });
+
+  function loadModel(source, label) {
+    setStatus('モデルを読み込み中…');
+    return PIXI.live2d.Live2DModel.from(source, { autoInteract: false }).then(function (m) {
+      if (model) { app.stage.removeChild(model); model.destroy(); }
+      model = m;
+      baseW = m.width / m.scale.x; baseH = m.height / m.scale.y;
+      m.anchor.set(0.5, 0.5);
+      app.stage.addChild(m);
+      hook(m);
+      layout();
+      setStatus(connected ? 'iPhoneと接続中' : 'モデルOK。iPhoneの接続待ち…', connected ? 'ok' : '');
+    }).catch(function (e) {
+      console.error(e);
+      setStatus('モデルを読み込めませんでした: ' + label, 'ng');
+    });
+  }
+
+  // ---------- トラッキング適用 ----------
+  var NEUTRAL = { ax: 0, ay: 0, az: 0, el: 1, er: 1, ex: 0, ey: 0, mo: 0, mf: 0, bl: 0, br: 0 };
+  var target = Object.assign({}, NEUTRAL), cur = Object.assign({}, NEUTRAL);
+  var lastData = 0, connected = false;
+
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+  function onData(d) {
+    if (!d || typeof d !== 'object') return;
+    lastData = performance.now();
+    if (!d.face) return; // 顔を見失っている間は直前の姿勢を保つ
+    var t = {};
+    Object.keys(NEUTRAL).forEach(function (k) { t[k] = typeof d[k] === 'number' && isFinite(d[k]) ? d[k] : NEUTRAL[k]; });
+    if (S.mirror) {
+      t.ax = -t.ax; t.az = -t.az; t.ex = -t.ex;
+      var a = t.el; t.el = t.er; t.er = a;
+      a = t.bl; t.bl = t.br; t.br = a;
+    }
+    if (S.invX) { t.ax = -t.ax; t.ex = -t.ex; }
+    if (S.invY) { t.ay = -t.ay; t.ey = -t.ey; }
+    if (S.invZ) { t.az = -t.az; }
+    target = t;
+  }
+
+  function setP(core, ids, v) {
+    for (var i = 0; i < ids.length; i++) core.setParameterValueById(ids[i], v);
+  }
+
+  function applyTracking(core) {
+    var now = performance.now();
+    // 2秒以上データが来なければ正面に戻す
+    var tgt = (now - lastData > 2000) ? NEUTRAL : target;
+    var k = 1 - clamp(S.smooth, 0, 0.95);
+    Object.keys(NEUTRAL).forEach(function (key) { cur[key] += (tgt[key] - cur[key]) * k; });
+    // まばたきは遅れると不自然なので速めに追従
+    cur.el += (tgt.el - cur.el) * 0.5; cur.er += (tgt.er - cur.er) * 0.5;
+
+    var g = S.gain;
+    var ax = clamp(cur.ax * g, -30, 30), ay = clamp(cur.ay * g, -30, 30), az = clamp(cur.az * g, -30, 30);
+    setP(core, ['ParamAngleX', 'PARAM_ANGLE_X'], ax);
+    setP(core, ['ParamAngleY', 'PARAM_ANGLE_Y'], ay);
+    setP(core, ['ParamAngleZ', 'PARAM_ANGLE_Z'], az);
+    setP(core, ['ParamBodyAngleX', 'PARAM_BODY_ANGLE_X'], ax / 3);
+    setP(core, ['ParamBodyAngleY', 'PARAM_BODY_ANGLE_Y'], ay / 3);
+    setP(core, ['ParamBodyAngleZ', 'PARAM_BODY_ANGLE_Z'], az / 3);
+    setP(core, ['ParamEyeLOpen', 'PARAM_EYE_L_OPEN'], clamp(cur.el, 0, 1));
+    setP(core, ['ParamEyeROpen', 'PARAM_EYE_R_OPEN'], clamp(cur.er, 0, 1));
+    setP(core, ['ParamEyeBallX', 'PARAM_EYE_BALL_X'], clamp(cur.ex, -1, 1));
+    setP(core, ['ParamEyeBallY', 'PARAM_EYE_BALL_Y'], clamp(cur.ey, -1, 1));
+    setP(core, ['ParamMouthOpenY', 'PARAM_MOUTH_OPEN_Y'], clamp(cur.mo, 0, 1));
+    setP(core, ['ParamMouthForm', 'PARAM_MOUTH_FORM'], clamp(cur.mf, -1, 1));
+    setP(core, ['ParamBrowLY', 'PARAM_BROW_L_Y'], clamp(cur.bl, -1, 1));
+    setP(core, ['ParamBrowRY', 'PARAM_BROW_R_Y'], clamp(cur.br, -1, 1));
+  }
+
+  function hook(m) {
+    var im = m.internalModel;
+    var origBlink = im.eyeBlink;
+    var origFocus = typeof im.updateFocus === 'function' ? im.updateFocus.bind(im) : null;
+    var run = function () {
+      if (lastData === 0) { // まだ一度も受信していない: 標準の自動まばたき等に任せる
+        if (origFocus) origFocus();
+        return;
+      }
+      im.eyeBlink = undefined; // 自動まばたきを止め、カメラの値を使う
+      applyTracking(im.coreModel);
+    };
+    if (origFocus) im.updateFocus = run;      // 物理演算（髪揺れ等）の前に値を入れる
+    else im.on('beforeModelUpdate', run);
+    void origBlink;
+  }
+
+  // ---------- 通信（PeerJS / WebRTC） ----------
+  var peer = null;
+  function startPeer() {
+    peer = new Peer('live2dcam-' + S.room);
+    peer.on('open', function () { if (!connected) setStatus(model ? 'iPhoneの接続待ち…' : 'モデルを読み込んでください'); });
+    peer.on('connection', function (conn) {
+      conn.on('open', function () { connected = true; setStatus('iPhoneと接続中', 'ok'); });
+      conn.on('data', onData);
+      conn.on('close', function () { connected = false; setStatus('iPhoneとの接続が切れました。再接続待ち…', 'ng'); });
+    });
+    peer.on('disconnected', function () { setTimeout(function () { try { peer.reconnect(); } catch (e) {} }, 2000); });
+    peer.on('error', function (err) {
+      console.warn(err);
+      if (err && err.type === 'unavailable-id') {
+        setStatus('同じルームコードのビューアが他で開いています。そちらを閉じて再読み込みしてください。', 'ng');
+      } else if (err && (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error')) {
+        setStatus('中継サーバーに接続できません。数秒後に再試行します…', 'ng');
+        setTimeout(function () { try { peer.destroy(); } catch (e) {} startPeer(); }, 4000);
+      }
+    });
+  }
+
+  // ---------- UI ----------
+  $('room').textContent = S.room;
+  var trackerUrl = new URL('tracker.html', location.href.split('?')[0]);
+  trackerUrl.searchParams.set('room', S.room);
+  try { new QRCode($('qr'), { text: trackerUrl.toString(), width: 150, height: 150 }); } catch (e) { $('qr').textContent = trackerUrl.toString(); }
+
+  $('modelUrl').value = S.model;
+  $('mirror').checked = S.mirror; $('invX').checked = S.invX; $('invY').checked = S.invY; $('invZ').checked = S.invZ;
+  $('gain').value = S.gain; $('smooth').value = S.smooth; $('bg').value = S.bg;
+  applyBg();
+
+  ['mirror', 'invX', 'invY', 'invZ'].forEach(function (k) { $(k).addEventListener('change', function () { S[k] = $(k).checked; save(); }); });
+  ['gain', 'smooth'].forEach(function (k) { $(k).addEventListener('input', function () { S[k] = parseFloat($(k).value); save(); }); });
+  $('bg').addEventListener('change', function () { S.bg = $('bg').value; applyBg(); save(); });
+  $('loadUrl').addEventListener('click', function () {
+    S.model = $('modelUrl').value.trim(); save();
+    if (S.model) loadModel(S.model, S.model);
+  });
+  $('pickBtn').addEventListener('click', function () { $('pick').click(); });
+  $('pick').addEventListener('change', function () {
+    var files = Array.prototype.slice.call($('pick').files || []);
+    if (files.length) loadModel(files, '選択したフォルダ（.model3.json が入ったフォルダを選んでください）');
+  });
+  $('resetPos').addEventListener('click', function () { S.z = 1; S.x = 0; S.y = 0; layout(); save(); });
+  $('copyObs').addEventListener('click', function () {
+    updateObsUrl();
+    var el = $('obsUrl'); el.select();
+    if (navigator.clipboard) navigator.clipboard.writeText(el.value).catch(function () {});
+  });
+  window.addEventListener('keydown', function (e) {
+    if ((e.key === 'h' || e.key === 'H') && e.target.tagName !== 'INPUT') document.body.classList.toggle('obs');
+  });
+
+  // ドラッグ移動・ホイール拡縮
+  var drag = null, cv = $('stage');
+  cv.addEventListener('pointerdown', function (e) { drag = { px: e.clientX, py: e.clientY, x: S.x, y: S.y }; cv.setPointerCapture(e.pointerId); });
+  cv.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    S.x = drag.x + (e.clientX - drag.px) / app.screen.width;
+    S.y = drag.y + (e.clientY - drag.py) / app.screen.height;
+    layout();
+  });
+  cv.addEventListener('pointerup', function () { if (drag) { drag = null; save(); } });
+  cv.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    S.z = clamp(S.z * (e.deltaY < 0 ? 1.08 : 1 / 1.08), 0.2, 8);
+    layout(); save();
+  }, { passive: false });
+
+  updateObsUrl();
+  startPeer();
+  if (S.model) loadModel(S.model, S.model); else setStatus('モデルを読み込んでください');
+})();
+</script>
+</body>
+</html>
